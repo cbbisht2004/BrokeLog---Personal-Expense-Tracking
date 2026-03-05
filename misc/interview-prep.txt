@@ -1,0 +1,247 @@
+================================================================================
+                        BROKERLOG — DELOITTE INTERVIEW PREP
+================================================================================
+
+================================================================================
+SECTION 1: APP OVERVIEW
+================================================================================
+
+WHAT THE APP DOES
+-----------------
+BrokerLog is a full-stack personal finance tracker. Users authenticate, then log
+financial transactions — each with a title, amount, and category (income vs.
+expense). The app maintains a running history and computes a live financial
+summary: total balance, total income, and total expenses.
+
+ONE-LINE PITCH:
+"BrokerLog is a cross-platform mobile finance tracker built on a serverless
+Node/Postgres backend, with Clerk-managed authentication, Redis-backed rate
+limiting, and a React Native frontend — designed to be secure, scalable, and
+low-maintenance from day one."
+
+
+ARCHITECTURE OVERVIEW
+---------------------
+The system is split into two distinct layers:
+
+  1. Mobile Frontend  — React Native (Expo)
+  2. Backend API      — Node.js / Express.js with a cloud database
+
+
+--------------------------------------------------------------------------------
+FRONTEND — React Native + Expo
+--------------------------------------------------------------------------------
+- Built with Expo Router, which uses file-based routing (similar to Next.js).
+  The folder structure under app/ directly maps to screen routes.
+
+- The (auth) group handles unauthenticated screens (sign-in, sign-up).
+  The root/ group is protected — it redirects to sign-in if the user isn't
+  authenticated.
+
+- A SafeScreen component wraps every screen to handle safe area insets (so
+  content doesn't bleed under the status bar on both iOS and Android).
+
+- Theming is centralized in constants/colors.js with four swappable themes
+  (coffee, forest, purple, ocean). One line change switches the entire app's
+  color palette — demonstrating separation of concerns in the UI layer.
+
+
+--------------------------------------------------------------------------------
+AUTHENTICATION — Clerk
+--------------------------------------------------------------------------------
+- Authentication is handled by Clerk, a third-party auth provider. This
+  offloads the complexity of password hashing, session management, and email
+  verification.
+
+- The ClerkProvider wraps the entire app in app/_layout.jsx.
+
+- Route guards are implemented in two layout files:
+    • (auth)/_layout.jsx  — redirects already signed-in users away from auth
+    • root/_layout.jsx    — redirects signed-out users to sign-in
+
+- This creates a clean, declarative authentication gate without scattering
+  auth checks across every screen.
+
+- Build-vs-buy reasoning: instead of rolling custom auth (which introduces
+  security risk), a proven provider handles it.
+
+
+--------------------------------------------------------------------------------
+BACKEND — Express.js REST API (MVC Pattern)
+--------------------------------------------------------------------------------
+  Layer        | File                         | Responsibility
+  -------------|------------------------------|-----------------------------
+  Routes       | transactionsRoute.js         | Defines URL endpoints
+  Controllers  | transactionsControllers.js   | Business logic
+  Config / DB  | db.js                        | Database connection
+
+API Endpoints:
+
+  Method  | Endpoint                            | What it does
+  --------|-------------------------------------|-------------------------------
+  GET     | /api/transactions/:user_id          | Fetch all transactions
+  POST    | /api/transactions                   | Create a new transaction
+  DELETE  | /api/transactions/:id               | Delete a transaction by ID
+  GET     | /api/transactions/summary/:user_id  | Aggregated balance/income/expenses
+
+The summary endpoint uses a single optimized SQL query with COALESCE and
+conditional SUM — rather than fetching all rows and calculating in JavaScript.
+This is intentional for performance at scale.
+
+
+--------------------------------------------------------------------------------
+DATABASE — NeonDB (Serverless PostgreSQL)
+--------------------------------------------------------------------------------
+- NeonDB is a serverless Postgres provider. It scales to zero when idle, making
+  it cost-effective for a project at this stage.
+
+- The schema is initialized on server startup via initDB() using
+  CREATE TABLE IF NOT EXISTS, so the server is self-bootstrapping.
+
+- The transactions table stores:
+    user_id, title, amount (decimal), category, created_at (defaults to today)
+
+- Parameterized queries via the sql template literal tag prevent SQL injection
+  by design — the library handles escaping automatically.
+
+
+--------------------------------------------------------------------------------
+SECURITY & RESILIENCE
+--------------------------------------------------------------------------------
+Rate Limiting (rateLimiter.js + upstash.js):
+  - Uses Upstash Redis with a sliding window algorithm
+  - 100 requests per 60 seconds per key
+  - Returns HTTP 429 Too Many Requests when exceeded
+  - Applied globally as middleware — every endpoint is protected automatically
+
+Input Validation:
+  - createTransaction validates all required fields before touching the database
+  - deleteTransaction validates the ID is numeric before querying — prevents
+    a class of runtime errors and stops the server from crashing on bad input
+
+
+--------------------------------------------------------------------------------
+KEY ENGINEERING DECISIONS
+--------------------------------------------------------------------------------
+1. Serverless infrastructure (NeonDB + Upstash Redis) — zero ops overhead,
+   scales automatically, pay-per-use. Appropriate for an early-stage product.
+
+2. Clerk for auth — proven build-vs-buy decision. Rolling custom auth
+   introduces security risk that a dedicated provider eliminates.
+
+3. Middleware-first backend design — rate limiting, body parsing, and logging
+   are middleware layers, keeping route handlers clean and single-purpose.
+
+4. Centralized theming — swapping the entire app's visual theme is one
+   variable change, demonstrating clean separation of concerns.
+
+
+================================================================================
+SECTION 2: REDIS — DEEP DIVE
+================================================================================
+
+WHAT IS REDIS?
+--------------
+Redis (Remote Dictionary Server) is an in-memory data store. Unlike a
+traditional database that reads and writes to disk, Redis keeps all its data in
+RAM. This makes it extraordinarily fast — sub-millisecond response times.
+
+It's a key-value store — data is stored and retrieved like a dictionary:
+
+  SET  "user:123:requests"  47
+  GET  "user:123:requests"  → 47
+
+
+BASIC ARCHITECTURE
+------------------
+  Client Request
+        ↓
+    Redis (RAM)
+    ┌─────────────────────────────────┐
+    │  Key           →  Value         │
+    │  "rate-limit"  →  { count: 47, │
+    │                     window: 60s}│
+    └─────────────────────────────────┘
+
+Key architectural properties:
+
+  • Single-threaded command execution — no race conditions. Every command is
+    atomic. When two requests arrive simultaneously and both try to increment a
+    counter, Redis processes them one at a time. The count is always accurate.
+
+  • Rich data structures — lists, sets, sorted sets, hashes, and counters with
+    expiry. Not just plain strings.
+
+  • TTL (Time To Live) — every key can have an expiry time. Redis handles
+    cleanup automatically. Old request counts just expire away. This is what
+    makes sliding window rate limiting possible.
+
+  • Persistence is optional — Redis can write snapshots to disk, but for rate
+    limiting we don't care if data survives a restart. Skipping persistence
+    keeps it fast.
+
+
+THE SLIDING WINDOW ALGORITHM
+-----------------------------
+Configured in upstash.js as:   Ratelimit.slidingWindow(100, "60 s")
+
+How it works:
+
+  Timeline:   0    10    20    30    40    50    60    70  (seconds)
+  Requests:   ██   ████  ██    ███         ██        ███
+
+  Window at t=70: looks back 60s → counts requests from t=10 to t=70
+  If count < 100  → allow
+  If count ≥ 100  → reject with 429
+
+Why sliding vs. fixed window?
+
+  A fixed window resets the counter every 60 seconds on the clock. A user could
+  send 100 requests at second 59, then 100 more at second 61 — effectively 200
+  requests in 2 seconds. A sliding window prevents that burst by always looking
+  at the most recent 60 seconds, regardless of when the clock resets.
+
+  Redis makes this cheap: it's just incrementing an in-memory counter and
+  checking a timestamp. No disk I/O. No complex queries.
+
+
+WHY REDIS FOR RATE LIMITING (NOT POSTGRES)?
+--------------------------------------------
+Consider what happens on every single API request:
+
+  Approach   | Cost per request
+  -----------|--------------------------------------------------
+  Postgres   | Open connection → write/update row → read back
+             | → close. Disk I/O involved.
+  Redis      | Increment an in-memory integer. Done.
+
+Rate limiting fires on EVERY request, before any real work happens. It must be
+near-instantaneous. If your rate limiter is slower than your actual API, it
+defeats the purpose. Redis is the industry-standard choice for this exact reason.
+
+
+WHY UPSTASH REDIS SPECIFICALLY?
+--------------------------------
+Standard Redis requires running a persistent server. Upstash is a serverless
+Redis provider:
+
+  - No server to manage or pay for when idle
+  - Connects over HTTPS — works from serverless/edge environments
+    (no persistent TCP connection required)
+  - Free tier covers this project's scale comfortably
+
+Redis.fromEnv() in upstash.js reads UPSTASH_REDIS_REST_URL and
+UPSTASH_REDIS_REST_TOKEN from the .env file — keeping credentials out of
+source code.
+
+
+ONE-LINE FOR THE INTERVIEWER:
+"Redis is an in-memory key-value store. We used it for rate limiting because it
+needs to run on every single request — it has to be faster than the API itself.
+Redis' atomic in-memory counters with automatic expiry make it the standard tool
+for this, and Upstash gives us that without managing any infrastructure."
+
+
+================================================================================
+END OF FILE
+================================================================================

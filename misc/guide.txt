@@ -1,0 +1,9 @@
+1) RATE LIMITING 
+(purposely overloading a web page to crash it or induce unexpected behaviour on the site)
+Which is why we need RATE LIMITING and error handlers
+2) our users can send 100 requests per 15mins
+3) 101th request is going to be cancelled, please try later 
+THE CODE for rate breached is 429 (too many requests)
+4) a perfect use case for middleware & REDIS
+5) UPSLASH provides these for free. 
+6) REDIS is a database
